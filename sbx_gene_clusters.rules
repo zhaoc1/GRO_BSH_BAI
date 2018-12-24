@@ -1,0 +1,237 @@
+# -*- mode: Snakemake -*-
+#
+# Chunyu Zhao 2018-07-23
+# Reads mapping to gene clusters/pathways/gene families of interest:
+#   Rules for Diamond or BLASTx reads against protein databases
+
+
+GENES_DIR = Cfg['sbx_gene_clusters']['genes_fp']
+
+GENES_KEY = [PurePath(f.name).stem for f in GENES_DIR.glob('*.fasta')]
+GENES_VAL = [str(GENES_DIR) + '/' + g+'.fasta' for g in GENES_KEY]
+
+GENES_DICT = dict(zip(GENES_KEY, GENES_VAL))
+
+TARGET_GENES = expand(str(MAPPING_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_1.m8'), 
+                     gene=GENES_DICT.keys(), sample=Samples.keys())
+
+TARGET_GENES_BLAST = expand(str(MAPPING_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_1.blastx'), 
+                     gene=GENES_DICT.keys(), sample=Samples.keys())
+
+rule _all_20181208_gro:
+ input:
+   expand(str(ANNOTATION_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_contigs.blastx'),
+             gene=['bai.operon_20180801','bsh_20180214','butyrate_20180612_cdhit'], sample=Samples.keys())
+
+
+rule _all_card:
+ input:
+  TARGET_CARD
+
+rule _all_genes:
+ input:
+   TARGET_GENES
+
+rule _all_genes_blast:
+ input:
+   TARGET_GENES_BLASTN
+
+rule merge_pairs:
+ message: "not now stay tuned"
+ input:
+  r1 = str(QC_FP/'decontam'/'{sample}_1.fastq.gz'),
+  r2 = str(QC_FP/'decontam'/'{sample}_2.fastq.gz')
+ output:
+  r1 = str(MAPPING_FP/'merged'/'{sample}.fastq')
+ threads:
+  Cfg['blast']['threads']
+ shell:
+  """
+  vsearch \
+    --fastq_mergepairs {input.r1} --reverse {input.r2} \
+    --fastqout {output.reads} --threads {threads} \
+    --fastq_allowmergestagger --fastq_maxdiffs 5 \
+    --fastq_minovlen 10 --fastq_minmergelen 100
+  """
+
+rule _test_diamond_db:
+ input:
+  expand(str(GENES_DIR/'{gene}.fasta.{index}'), index=['dmnd'], gene=GENES_DICT.keys())
+
+rule build_diamond_db:
+ input:
+  lambda wildcards: GENES_DICT[wildcards.gene]
+ output:
+  expand(str(GENES_DIR/'{{gene}}.fasta.{index}'),index=['dmnd'])
+ shell:
+  """
+  diamond makedb --in {input} -d {input} 
+  """
+
+
+rule _test_blast_db:
+ input:
+  expand(str(GENES_DIR/'{gene}.fasta.{index}'),index=['psq','pin','phr'], gene=GENES_DICT.keys())
+
+rule build_blast_db:
+ input:
+  lambda wildcards: GENES_DICT[wildcards.gene]
+ output:
+  expand(str(GENES_DIR/'{{gene}}.fasta.{index}'),index=['psq','pin','phr'])
+ shell:
+  """
+  makeblastdb -in {input} -dbtype prot
+  """
+
+
+rule _all_fa:
+ input: 
+  expand(str(MAPPING_FP/'R1'/'{sample}_1.fasta'), sample=Samples.keys() )
+
+rule fq_2_fa:
+ input:
+  str(QC_FP/'decontam'/'{sample}_1.fastq.gz')
+ output:
+  str(MAPPING_FP/'R1'/'{sample}_1.fasta')
+ shell:
+  """
+  seqtk seq -a < <(gzip -cd {input}) > {output}
+  """
+
+rule diamond_reads:
+ input:
+  read = str(MAPPING_FP/'R1'/'{sample}_1.fasta'),
+  db = expand(str(GENES_DIR/'{{gene}}.fasta.{index}'), index=['dmnd'])
+ output:
+  str(MAPPING_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_1.m8')
+ threads:
+  Cfg['sbx_gene_clusters']['threads']
+ shell:
+  """
+  diamond blastx \
+          --db {input.db} --query {input.read} \
+          --threads {threads} --evalue 1e-6 \
+          --max-target-seqs 0 \
+          --out {output} \
+          --outfmt 6 qseqid sseqid pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore
+  """
+
+rule blastx_reads:
+ input:
+  read = str(MAPPING_FP/'R1'/'{sample}_1.fasta'),
+  db = expand(str(GENES_DIR/'{{gene}}.fasta.{index}'), index=['psq','pin','phr'])
+ output:
+  str(MAPPING_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_1.blastx')
+ params:
+  db=lambda wildcard: GENES_DICT[wildcard.gene]
+ threads:
+  Cfg['sbx_gene_clusters']['threads']
+ shell:
+  """
+  blastx -query {input.read} -db {params.db} \
+         -num_threads {threads} -evalue 1e-6 \
+         -max_target_seqs 10 \
+         -out {output} \
+         -outfmt "6 qseqid sseqid pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore"
+  """
+
+rule blastn_reads:
+ input:
+  read = str(MAPPING_FP/'R1'/'{sample}_1.fasta'),
+  db = expand(str(GENES_DIR/'{{gene}}.fa.{index}'),  index=['nsq','nin','nhr'] )
+ output:
+  str(MAPPING_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_1.blastn')
+ params:
+  db=lambda wildcard: GENES_DICT[wildcard.gene]
+ threads:
+  Cfg['sbx_gene_clusters']['threads']
+ shell:
+  """
+  blastn -query {input.read} -db {params.db} \
+         -num_threads {threads} -evalue 1e-6 \
+         -max_target_seqs 10 \
+         -out {output} \
+         -outfmt "6 qseqid sseqid pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore"
+  """
+
+
+rule _all_genes_contigs:
+ input:
+  expand(str(ANNOTATION_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_contigs.blastx'),
+             gene=GENES_DICT.keys(), sample=Samples.keys())
+rule _all_bsh_contigs:
+ input:
+  expand(str(ANNOTATION_FP/'sbx_gene_clusters'/'bsh_20180214'/'{sample}_contigs.blastx'),
+             sample=Samples.keys())
+
+rule _all_bai_contigs:
+ input:
+  expand(str(ANNOTATION_FP/'sbx_gene_clusters'/'bai.operon_20180801'/'{sample}_contigs.blastx'),
+             sample=Samples.keys())
+
+rule _all_20181005:
+ input:
+   expand(str(ANNOTATION_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_contigs.blastx'),
+             gene=['butyrate_20180612_cdhit','protein_fasta_protein_homolog_model_cdhit', '20181005_uniprot_metal_uptake_cdhit'], sample=Samples.keys())
+
+rule blastx_contigs:
+ input:
+  contig = str(ASSEMBLY_FP/'contigs'/'{sample}-contigs.fa'),
+  db = expand(str(GENES_DIR/'{{gene}}.fasta.{index}'), index=['psq','pin','phr'])
+ output:
+  str(ANNOTATION_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_contigs.blastx')
+ params:
+  db=lambda wildcard: GENES_DICT[wildcard.gene]
+ threads: Cfg['sbx_gene_clusters']['threads']
+ shell:
+  """
+  blastx -query {input.contig} -out {output} -num_threads {threads}  \
+         -evalue 1e-6 -max_target_seqs 100 -db {params.db} \
+         -outfmt "6 qseqid sseqid pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore"
+  """
+
+
+rule _all_paloc_contigs:
+ input:
+  expand(str(ANNOTATION_FP/'sbx_gene_clusters'/'paloc'/'{sample}_contigs.blastn'),
+             sample=Samples.keys())
+
+rule blastn_contigs:
+ input:
+  contig = str(ASSEMBLY_FP/'contigs'/'{sample}-contigs.fa'),
+  db = expand(str(GENES_DIR/'{{gene}}.fa.{index}'), index=['nsq','nin','nhr'])
+ output:
+  str(ANNOTATION_FP/'sbx_gene_clusters'/'{gene}'/'{sample}_contigs.blastn')
+ params:
+  db=lambda wildcard: GENES_DICT[wildcard.gene]
+ threads: Cfg['sbx_gene_clusters']['threads']
+ shell:
+  """
+  blastn -query {input.contig} -out {output} -num_threads {threads}  \
+         -evalue 1e-6 -max_target_seqs 100 -db {params.db} \
+         -outfmt "6 qseqid sseqid pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore"
+  """
+
+rule _all_paloc_contigs_alter:
+ input:
+  expand(str(ANNOTATION_FP/'sbx_gene_clusters'/'paloc'/'20181005'/'{sample}_contigs.blastn'),
+             sample=Samples.keys())
+
+rule blastn_contigs_alter:
+ input:
+  contig = str(ASSEMBLY_FP/'contigs'/'{sample}-contigs.fa'),
+  db = str(GENES_DIR/'{gene}.fa')
+ output:
+  str(ANNOTATION_FP/'sbx_gene_clusters'/'{gene}'/'20181005'/'{sample}_contigs.blastn')
+ params:
+  contig = str(ANNOTATION_FP/'sbx_gene_clusters'/'{gene}'/'20181005'/'{sample}-contigs.fa'),
+  db=lambda wildcard: GENES_DICT[wildcard.gene]
+ threads: Cfg['sbx_gene_clusters']['threads']
+ shell:
+  """
+  cp {input.contig} {params.contig}
+  makeblastdb -in {params.contig} -dbtype nucl
+  blastn -query {input.db} -out {output} -num_threads {threads}  \
+         -evalue 1e-6 -max_target_seqs 100 -db {params.contig} \
+         -outfmt "6 qseqid sseqid pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore"
+  """

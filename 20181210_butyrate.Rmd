@@ -1,0 +1,1243 @@
+---
+title: "butyrate producing genes annotation"
+author: "Chunyu Zhao"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+header-includes:
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+output:
+  pdf_document:
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+geometry: "left=2cm,right=2cm,top=2cm,bottom=2cm"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dpi=100,
+  fig.align = "center",
+  fig.width = 8,
+  cache.lazy = FALSE,
+  dev=c("png", "pdf"),
+  warning=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(readr)
+library(reshape2)
+library(ggbeeswarm)
+library(scales)
+library(stringr)
+library(RColorBrewer)
+library(viridis)
+library(pander)
+library(magrittr)
+library(forcats)
+library(ggbeeswarm)
+library(ggsci)
+library(scales)
+
+library(broom)
+library(gridExtra)
+library(grid)
+
+library(pheatmap)
+
+source("new_helper.R")
+```
+
+
+# butyrate-producing bacterial
+
+Butyrate-producing bacteria have recently gained attention, since they are important for a healthy colon and when altered contribute to emerging disease, such as ulcerative colitis and type II diabetes.
+
+- a butyrate-producing taxonomic core in healthy colons
+
+- two *final* genes in the two primary bacterial butyrate synthesis pathways, butyryl-CoA: acetate Coa-transferase (but) and butyrate kinase (buk).
+
+- butyrate-producing community
+
+- important things let's say it three times:
+
+Eubacterium spp. and Roseburia spp (Clostridum cluster XIVa) and Faealibacterium prausnitzii (Clostridium cluster IV).
+
+## butyrate meta
+
+```{r}
+butyrate.meta <- read_delim("sunbeam_databases/dbs/butyrate_20180612.tsv", delim="\t") 
+
+# remove genes without a Genome.ID
+butyrate.meta %<>% filter(! is.na(Genome.ID))
+
+butyrate.meta %<>% select(Gene.ID, Enzyme, KO, gene_name, pathway_name, Phylum : Species) 
+
+butyrate.genes <- butyrate.meta %>% select(Gene.ID, gene_name, pathway_name) %>%
+  dplyr::rename(GeneID = `Gene.ID`)
+
+# length(pathway)
+butyrate.meta %>%
+  dplyr::count(pathway_name, gene_name) %>%
+  pander(caption = "butyprate producing genes database first look")
+
+butyrate.basic <- butyrate.meta %>%
+  dplyr::count(pathway_name, gene_name) %>%
+  select(pathway_name, gene_name)
+```
+
+## read in contigs
+
+```{r, eval=FALSE}
+read_bsh_blastx <- function(sample.id){
+
+  contigs.gc <- read_delim(file.path(gc_dir, paste(sample.id, "_contigs.blastx", sep="")), delim="\t", col_names=F)
+  
+  if (nrow(contigs.gc) == 0 )
+    return(data.frame(qseqid = NA))
+  
+  contigs.gc %<>% set_colnames(c("qseqid", "sseqid", "pident", "qlen","slen","alnLen", "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "e_value", "bit_score"))
+  
+  contigs.gc %<>% mutate(scov = alnLen/slen)
+  
+  contigs.gc %<>% left_join(butyrate.genes, by=c("sseqid" = "GeneID")) 
+  
+  return(contigs.gc)
+}
+
+gc_dir <- file.path("sunbeam_output/annotation/sbx_gene_clusters/butyrate_20180612_cdhit")
+samples <- sub("_contigs.blastx", "", list.files(gc_dir))
+
+butyrate.contig.blast <- bind_rows(lapply(1:length(samples), function(x) data.frame(sample = samples[x], read_bsh_blastx(samples[x]))))
+
+saveRDS(butyrate.contig.blast, file="butyrate_blastx_20181210.rds")
+```
+
+## pident and scov
+
+```{r, fig.height=10, fig.width=14}
+butyrate.contig.blast <- readRDS("butyrate_blastx_20181210.rds")
+
+butyrate.contig.blast %>%
+  ggplot(aes(x = pident, fill = gene_name)) + 
+  geom_histogram() +
+  facet_wrap(~gene_name, scale="free_y", ncol=4) +
+  ggtitle("distribution for ident") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  geom_vline(xintercept = 40, colour = "red", linetype = 2)
+
+butyrate.contig.blast %>%
+  ggplot(aes(x = scov, fill = gene_name)) +
+  geom_histogram() +
+  facet_wrap(~gene_name, scale="free_y", ncol=4) +
+  ggtitle("distribution for butyrate gene coverage") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  geom_vline(xintercept = 0.6, colour = "red", linetype = 2)
+
+pident.cutoff <- 40
+scov.cutoff <- 0.6
+
+butyrate.contig.blast %<>% 
+  filter(pident >= pident.cutoff) %>%
+  filter(scov >= scov.cutoff) 
+
+butyrate.contig.blast %<>%
+  group_by(sample, qseqid, gene_name) %>% 
+  arrange(desc(bit_score)) %>%
+  filter(row_number() == 1) %>%
+  ungroup()
+
+saveRDS(butyrate.contig.blast, file="butyrate_contig_blast_20181210.rds")
+```
+
+- set `pident.cutoff` to `r pident.cutoff` and `scov.cutoff` to `r scov.cutoff` for the downstream analysis.
+
+## per base coverage
+
+```{r, eval=FALSE}
+get_per_base_cov <- function(sample.id, bsh.contig.blast){
+  print(sample.id)
+  .bsh <- bsh.contig.blast %>% filter(sample %in% sample.id)
+  
+  depth_fp <- "sunbeam_output/coverage"
+  per.base.cov <- read_delim(file.path(depth_fp, paste(sample.id, ".depth", sep="")), delim="\t", col_names = F)
+  colnames(per.base.cov) <- c("qseqid", "base", "cov")
+  
+  qseqids <- unique(.bsh$qseqid)
+  
+  perbase <- do.call(rbind, lapply(1:length(qseqids), function(x){
+    qseq <- qseqids[x]
+    .bsh %<>% filter(qseqid %in% qseq) %>% 
+      mutate(qmin = pmin(qstart, qend), qmax = pmax(qstart, qend))
+    
+    qstart <- .bsh %>% filter(qseqid %in% qseq) %>% .$qmin
+    qend <- .bsh %>% filter(qseqid %in% qseq) %>% .$qmax
+    
+    per.base.cov %>%
+      filter(qseqid %in% qseq) %>%
+      filter(base >= qstart & base <= qend) %>% 
+      summarise(perbaseSum= sum(cov), perbaseMedian = median(cov), perbaseSd = sd(cov), perbaseLen = n(), perbaseMin = min(cov), perbaseMax = max(cov), perbaseMean = mean(cov)) %>%
+      mutate(qseqid = qseq) %>%
+      select(qseqid, everything())
+  }))
+}
+
+butyrate.contig.blast <- readRDS("butyrate_contig_blast_20181210.rds")
+samples <- unique(butyrate.contig.blast$sample)
+butyrate.per.base <- lapply(1:length(samples), function(x) data.frame(sample= samples[x], get_per_base_cov(samples[x], butyrate.contig.blast)))
+
+butyrate.per.base.df <- bind_rows(butyrate.per.base)
+
+saveRDS(butyrate.per.base.df, file="butyrate.per.base.df_201811210.rds")
+```
+
+## merga data
+
+```{r}
+blastn.common <- readRDS("blastn_common_20181208.rds") %>%
+  filter(species == common_taxa) %>%
+  select(sample, qseqid, superkingdom:common_taxa) %>%
+  ungroup()
+
+butyrate.contig.blast %<>%
+  filter(qlen >= 500) %>%
+  left_join(blastn.common, by=c("sample", "qseqid"))
+
+contigs.coverage <- read_delim("sunbeam_output/coverage/contigs_coverage.csv", delim=",")
+butyrate.contig.blast %<>%
+  left_join(contigs.coverage, by=c("sample"="sample", "qseqid"="contig"))
+
+butyrate.contig.blast %<>% filter(!is.na(phylum))
+
+butyrate.per.base.df <- readRDS("butyrate.per.base.df_201811210.rds")
+butyrate.contig.blast %<>%
+  left_join(butyrate.per.base.df, by=c("sample"="sample", "qseqid"="qseqid"))
+```
+
+## a complete butyrate producing pathway
+
+```{r, fig.height=2, fig.width=10}
+## game time, lets find the contig with themost 
+contig.largest <- butyrate.contig.blast %>%
+  group_by(sample,qseqid) %>%
+  dplyr::count() %>%
+  arrange(desc(n)) %>%
+  head(n = 1)
+
+sample.id <- contig.largest$sample
+contig.largest <- contig.largest$qseqid
+
+contig.toplot <- butyrate.contig.blast %>%
+  mutate(common_taxa = as.character(common_taxa)) %>%
+  filter(sample %in% sample.id) %>%
+  filter(qseqid %in% contig.largest)
+
+species <- contig.toplot$common_taxa %>% unique()
+contig.toplot %>%
+  mutate(xmin = pmin(qstart, qend), xmax = pmax(qstart, qend)) %>%
+  ggplot() + 
+  geom_rect(aes(xmin = xmin, xmax = xmax, fill=pident), ymin = -Inf, ymax = Inf, color = NA, alpha = 0.9) + 
+  geom_text(aes(x = xmin, y = 0.01, label=gene_name), size = 3, vjust = 0, hjust = 0, check_overlap = FALSE) +
+  geom_vline(aes(xintercept = as.numeric(xmin)), colour = "grey50", alpha = 0.8) +
+  ylim(c(0, 0.1)) +
+  theme_bw() +
+  scale_fill_viridis(alpha=0.9, discrete=FALSE) +
+  ggtitle(paste("complete butyrate annotation for \n", sample.id, "\n(contig ", contig.largest,", ", species,")", sep="")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(x = "butyrate gene position in assembled contig", y = "") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          axis.text.y=element_blank(), axis.ticks.y = element_blank()) +
+  facet_wrap( ~ pathway_name)
+```
+
+```{r}
+butyrate.contig.blast %<>% select(sample, qseqid, sseqid, gene_name, pathway_name, alnLen, phylum:common_taxa, perbaseSum, perbaseLen, perbaseMean, perbaseMedian, median, length)
+
+readlength <- 126
+
+toadd <- butyrate.contig.blast %>%
+  group_by(sample, qseqid, gene_name) %>%
+  summarise(ButyrateReadCounts = sum(perbaseSum)/readlength) %>%
+  ungroup()
+
+butyrate.contig.blast %<>% 
+  left_join(toadd, by=c("sample", "qseqid", "gene_name")) 
+```
+
+## metadata
+
+```{r}
+s <- read.table(file.path("sunbeam_output/mennella_metadata_20161206.txt"), sep="\t", header = TRUE) %>%
+  dplyr::select(CHOPSampleID, SubjectID, study_month, study_group, CHILD_GENDER, CHILD_RACE, CHILD_NORM.RAPID.GROWTH, TAS2r38) %>%
+  dplyr::rename(SampleID = CHOPSampleID) %>%
+  mutate(SampleID = sub("-","_", SampleID))
+
+read_counts <- read.table(file.path("sunbeam_output/preprocess_summary.tsv"), header = T) %>%
+  mutate(Samples = sub(".json", "", Samples, fixed = TRUE)) %>%
+  mutate(low_quality = (fwd_only + rev_only + dropped) / input) %>%
+  mutate(human = true / input) %>%
+  mutate(non_human = false / input) %>%
+  dplyr::rename(HostReads=true, NonHostReads=false, SampleID = Samples)
+
+s <- merge(s, read_counts, by="SampleID") %>%
+  mutate(SubjectID = as.factor(SubjectID)) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  mutate(study_group = as.factor(study_group)) %>%
+  mutate(study_month = as.factor(study_month)) #<- just for visualization
+
+s %<>% 
+  #filter(! study_month  %in% 0.5) %>%
+  mutate(study_group = fct_recode(study_group, "CMF"="A", "EHF"="B"))
+
+butyrate.contig.blast %<>% filter(sample %in% s$SampleID) %>% mutate(common_taxa = as.character(common_taxa))
+```
+
+
+```{r}
+saveRDS(butyrate.contig.blast, file="butyrate.contig.blast_20181212.rds")
+```
+
+# bysample: total pathway abundance
+
+```{r}
+bysample <- butyrate.contig.blast %>%
+  group_by(sample, gene_name) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  spread(gene_name, totalReadCounts, fill = 0) %>%
+  gather(gene_name, totalReadCounts, `4Hbt` : Thl) %>%
+  left_join(s, by=c("sample" = "SampleID")) %>% 
+  mutate(totalReadCounts = ifelse(is.na(totalReadCounts), 0, as.numeric(totalReadCounts))) %>%
+  mutate(isPresent = ifelse(totalReadCounts > 0, TRUE, FALSE)) %>%
+  mutate(prop = totalReadCounts/NonHostReads) %>% 
+  left_join(butyrate.basic, by=c("gene_name"))
+```
+
+- non zero proportion and non zero regression
+
+```{r, fig.width=8, fig.height=12}
+f1 <- bysample %>%
+  select(sample, study_month, study_group, isPresent) %>%
+  unique() %>%
+  group_by(study_month, study_group) %>%
+  mutate(nonzero_proportion = mean(isPresent)) %>%
+  ungroup() %>% 
+  select(study_group, study_month, nonzero_proportion) %>% 
+  unique() %>% 
+  ggplot(aes(x = study_group, y = nonzero_proportion, fill = study_group)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~study_month) +
+  scale_fill_aaas() +
+  theme_bw() +
+  labs(x = "", y = "Non zero proportion") +
+  theme(axis.text.x=element_text(angle = 30, hjust = 0.8))
+
+f2 <- bysample %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(pathway_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas(guide=FALSE) +
+    scale_fill_aaas(guide=FALSE) +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of butyrate producing pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ pathway_name, scales = "free", ncol=1)
+
+f3 <- bysample %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~pathway_name, scales = "free", ncol=1) +
+  labs(x="",y="") 
+
+set.seed(123)
+#grid.newpage()
+grid.arrange(f1, f2, f3,
+             ncol=2, widths=c(1,2), heights=c(1,3),
+             layout_matrix = rbind(c(1,1), c(2,3)),
+             top = "Raw butyrate producing pathway abundance without any proper filtering ")
+```
+
+### gene versus pathway
+
+```{r fig.width=15, fig.height=12}
+### all five time points linear mixed effects
+
+library(nlme)
+
+logit <- function (p) log(p / (1 - p))
+
+totest <- bysample %>% filter(totalReadCounts > 0) %>% mutate(LogProp = log10(prop + 1e-6))
+
+genes.tokeep <- totest %>%  filter(totalReadCounts > 0) %>% dplyr::count(gene_name, study_group, study_month) %>% filter(n >= 6) %>% .$gene_name %>% unique()
+
+lme_models <- totest %>%
+  filter(gene_name %in% genes.tokeep) %>%
+  group_by(gene_name) %>%
+  do(mod = lme(LogProp ~ study_group * study_month, random = ~ 1 | SubjectID, data=.)) %>%
+  ungroup()
+
+tidy_lme <- function(mod) {
+  mod <- summary(mod)
+  data.frame(term  = rownames(mod$tTable), mod$tTable, row.names=NULL)
+}
+
+summaries <- lapply(1:length(lme_models$mod), function(x) data.frame(tidy_lme(lme_models$mod[[x]]), gene_name=lme_models$gene_name[[x]], stringsAsFactors=FALSE))
+
+summaries_df <- do.call(rbind,summaries) %>% filter(term != '(Intercept)')
+
+summaries_df %<>%
+  filter(! is.na(p.value)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>% 
+  #filter(p.value <= 0.05) %>% 
+  filter(fdr <= 0.1) %>% 
+  dplyr::select(gene_name, everything()) %>%
+  arrange(term) %>%
+  mutate(term = gsub("study_group", "", term))
+
+genes.sig <- summaries_df$gene_name %>% unique()
+pander(summaries_df, keep.line.breaks=T, split.table = Inf, caption="lme result")
+
+
+bysample %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(pathway_name, gene_name, study_group, study_month) %>%
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  mutate(gene_label = ifelse(gene_name %in% genes.sig, paste(gene_name, "*", sep=""), as.character(gene_name))) %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of butyrate producing genes") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(pathway_name ~  gene_name, scales = "free")
+```
+
+### formula effect at 4.5 month
+
+```{r}
+totest <- bysample %>% mutate(LogProp = log10(prop + 1e-6)) %>% filter(study_month %in% 4.5) %>% droplevels()
+
+lme_models <- totest %>%
+  group_by(gene_name) %>%
+  do(tidy(lm(LogProp ~ study_group, data=.))) %>% 
+  ungroup()
+
+lme_models %<>%
+  filter(term != '(Intercept)') %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value <= 0.1) %>%
+  mutate(term = gsub("study_group", "CMF-", term))
+
+options(scipen=1, digits=3)
+pander(lme_models, keep.line.breaks=T, split.table = Inf, caption="lm result")
+```
+
+# lysine pathway
+
+There are eight genes in the lysine pathway and we call `present` only when at least four genes were deteced from the metagenomics data.
+
+```{r, fig.width=7, fig.height=6}
+#butyrate.basic %>% filter(pathway_name %in% "Lysine")
+custome.levels <- c("KamA", "KamD", "KamE", "Kdd", "Kce","Kal","AtoA", "AtoD")
+
+lysine <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "Lysine") %>%
+  group_by(sample, gene_name) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  spread(gene_name, totalReadCounts, fill = 0)
+
+temp <- lysine %>% select(AtoA:Kdd)
+lysine <- lysine[apply(temp, 1, function(x) sum(x > 0) ) >= 4, ]
+
+lysine %<>% gather(gene_name, totalReadCounts, AtoA:Kdd) %>% mutate(gene_name = factor(gene_name, levels=custome.levels))
+
+lysine <- left_join(s, lysine, by=c("SampleID" = "sample")) %>% 
+  mutate(totalReadCounts = ifelse(is.na(totalReadCounts), 0, as.numeric(totalReadCounts))) %>%
+  mutate(isPresent = ifelse(totalReadCounts > 0, TRUE, FALSE)) %>%
+  mutate(prop = totalReadCounts/NonHostReads) %>% 
+  left_join(butyrate.basic, by=c("gene_name"))
+
+f1 <- lysine %>%
+  select(SampleID, study_month, study_group, isPresent) %>%
+  unique() %>%
+  group_by(study_month, study_group) %>%
+  mutate(nonzero_proportion = mean(isPresent)) %>%
+  ungroup() %>% 
+  select(study_group, study_month, nonzero_proportion) %>% 
+  unique() %>% 
+  ggplot(aes(x = study_group, y = nonzero_proportion, fill = study_group)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~study_month) +
+  scale_fill_aaas(guide=FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Non zero proportion") +
+  theme(axis.text.x=element_text(angle = 30, hjust = 0.8))
+
+f2 <- lysine %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(pathway_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas(guide=FALSE) +
+    scale_fill_aaas(guide=FALSE) +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of Lysine pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ pathway_name, scales = "free", ncol=1)
+
+
+f3 <- lysine %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~ pathway_name, scales = "free", ncol=1) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.arrange(f1, f2, f3,
+             ncol=2, widths=c(1.2,1), heights=c(1,1),
+             layout_matrix = rbind(c(1,2), c(3,3)),
+             top = "Lysine pathway abundance after filtering")
+```
+
+```{r, fig.width=10, fig.height=10}
+f1 <- lysine %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(gene_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of butyrate producing pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ gene_name, scales = "free", ncol=3)
+
+f2 <- lysine %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~gene_name, scales = "free", ncol=3) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.newpage()
+grid.arrange(f1, f2,
+             ncol=1,
+             top = "butyrate producing gene abundance in Lysine pathway")
+```
+
+```{r, fig.width=6.5, fig.height=3}
+butyrate.contig.blast %>%
+  filter(pathway_name %in% "Lysine") %>%
+  filter(phylum %in% c("p__Firmicutes","p__Proteobacteria")) %>%
+  group_by(sample, gene_name, phylum) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>% 
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  filter(totalReadCounts > 0 ) %>%
+  mutate(prop = totalReadCounts / NonHostReads) %>% 
+  group_by(study_group, study_month, phylum) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ phylum, scales = "free")
+
+toplot <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "Lysine") %>%
+  count(gene_name, common_taxa) %>%
+  arrange(desc(n)) %>%
+  filter(n >= 5) %>%
+  .$common_taxa %>%
+  unique()
+
+butyrate.contig.blast %>%
+  filter(ButyrateReadCounts > 0) %>%
+  filter(pathway_name %in% "Lysine") %>%
+  filter(common_taxa %in% toplot[1:2])  %>%
+  group_by(sample, gene_name, common_taxa) %>%
+  summarise(totalButyrateReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  mutate(prop = totalButyrateReadCounts / NonHostReads) %>%
+  group_by(study_group, study_month, common_taxa) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ common_taxa, scales = "free")
+```
+```{r, fig.width=10, fig.height=12}
+butyrate.contig.blast %>%
+  filter(pathway_name %in% "Lysine") %>%
+  filter(common_taxa %in% toplot) %>%
+  group_by(sample, gene_name, common_taxa) %>%
+  summarise(totalButyrateReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  mutate(prop = totalButyrateReadCounts / NonHostReads) %>%
+  ggplot(aes(SubjectID, common_taxa, fill=prop)) +
+  geom_tile(color="grey80", size=0.4) +
+  viridis::scale_fill_viridis(na.value="white", option = "A", direction = -1) +
+  theme_classic() +
+  theme(
+    axis.line = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y="common ancestor on species level",
+    fill="totalButyrateReadCounts \nper sample per genus"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(  ~ study_group + study_month, scale="free_x")
+```
+
+\newpage
+# TCA cycle pathway
+
+There are three genes in the lysine pathway and we call `present` only when at least **two** genes were deteced from the metagenomics data.
+
+```{r, fig.width=6, fig.height=6}
+#butyrate.basic %>% filter(pathway_name %in% "4aminobutyrate")
+custome.levels <- c("AbfH", "4Hbt", "AbfD-Isom")
+
+tca <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "4aminobutyrate") %>%
+  group_by(sample, gene_name) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  spread(gene_name, totalReadCounts, fill = 0)
+
+temp <- tca %>% select(`4Hbt`:AbfH)
+tca <- tca[apply(temp, 1, function(x) sum(x > 0) ) >= 2, ]
+
+tca %<>% 
+  gather(gene_name, totalReadCounts, `4Hbt`:AbfH) %>% 
+  mutate(gene_name = factor(gene_name, levels=custome.levels))
+
+tca <- left_join(s, tca, by=c("SampleID" = "sample")) %>% 
+  mutate(totalReadCounts = ifelse(is.na(totalReadCounts), 0, as.numeric(totalReadCounts))) %>%
+  mutate(isPresent = ifelse(totalReadCounts > 0, TRUE, FALSE)) %>%
+  mutate(prop = totalReadCounts/NonHostReads) %>% 
+  left_join(butyrate.basic, by=c("gene_name"))
+
+f1 <- tca %>%
+  select(SampleID, study_month, study_group, isPresent) %>%
+  unique() %>%
+  group_by(study_month, study_group) %>%
+  mutate(nonzero_proportion = mean(isPresent)) %>%
+  ungroup() %>% 
+  select(study_group, study_month, nonzero_proportion) %>% 
+  unique() %>% 
+  ggplot(aes(x = study_group, y = nonzero_proportion, fill = study_group)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~study_month) +
+  scale_fill_aaas(guide=FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Non zero proportion") +
+  theme(axis.text.x=element_text(angle = 30, hjust = 0.8))
+
+f2 <- tca %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(pathway_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas(guide=FALSE) +
+    scale_fill_aaas(guide=FALSE) +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of Lysine pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ pathway_name, scales = "free", ncol=1)
+
+
+f3 <- tca %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~ pathway_name, scales = "free", ncol=1) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.arrange(f1, f2, f3,
+             ncol=2, widths=c(1.2,1), heights=c(1,1),
+             layout_matrix = rbind(c(1,2), c(3,3)),
+             top = "4-Aminobutyrate /Succinate pathway abundance after filtering")
+```
+
+```{r, fig.width=8, fig.height=5}
+f1 <- tca %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(gene_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of butyrate producing pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ gene_name, scales = "free", ncol=3)
+
+f2 <- tca %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~gene_name, scales = "free", ncol=3) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.newpage()
+grid.arrange(f1, f2,
+             ncol=1,
+             top = "butyrate producing gene abundance in Succinate pathway")
+```
+
+```{r, fig.width=4.5, fig.height=3}
+butyrate.contig.blast %>%
+  filter(pathway_name %in% "4aminobutyrate") %>%
+  filter(phylum %in% c("p__Firmicutes")) %>%
+  group_by(sample, gene_name, phylum) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>% 
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  filter(totalReadCounts > 0 ) %>%
+  mutate(prop = totalReadCounts / NonHostReads) %>% 
+  group_by(study_group, study_month, phylum) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing Succinate pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ phylum, scales = "free")
+```
+```{r, fig.width=6.5, fig.height=5}
+toplot <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "4aminobutyrate") %>%
+  count(gene_name, common_taxa) %>%
+  arrange(desc(n)) %>%
+  filter(n >= 5) %>%
+  .$common_taxa %>%
+  unique()
+
+butyrate.contig.blast %>%
+  filter(ButyrateReadCounts > 0) %>%
+  filter(pathway_name %in% "4aminobutyrate") %>%
+  filter(common_taxa %in% toplot[1:4])  %>%
+  group_by(sample, gene_name, common_taxa) %>%
+  summarise(totalButyrateReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  mutate(prop = totalButyrateReadCounts / NonHostReads) %>%
+  group_by(study_group, study_month, common_taxa) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing Succinate pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ common_taxa, scales = "free")
+```
+
+\newpage
+# Glutarate pathway
+There are eight genes in the lysine pathway and we call `present` only when at least **four** genes were deteced from the metagenomics data.
+
+```{r, fig.width=7.6, fig.height=6}
+butyrate.basic %>% filter(pathway_name %in% "Glutarate")
+custome.levels <- c("HgdA", "HgdB", "GctA", "GctB", "HgCoAd_A", "HgCoAd_B","HgCoAd_C")
+
+glutarate <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "Glutarate") %>%
+  group_by(sample, gene_name) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  spread(gene_name, totalReadCounts, fill = 0)
+
+temp <- glutarate %>% select(`GctA`:HgdB)
+glutarate <- glutarate[apply(temp, 1, function(x) sum(x > 0) ) >= 2, ]
+
+glutarate %<>% 
+  gather(gene_name, totalReadCounts, `GctA`:HgdB) %>% 
+  mutate(gene_name = factor(gene_name, levels=custome.levels))
+
+glutarate <- left_join(s, glutarate, by=c("SampleID" = "sample")) %>% 
+  mutate(totalReadCounts = ifelse(is.na(totalReadCounts), 0, as.numeric(totalReadCounts))) %>%
+  mutate(isPresent = ifelse(totalReadCounts > 0, TRUE, FALSE)) %>%
+  mutate(prop = totalReadCounts/NonHostReads) %>% 
+  left_join(butyrate.basic, by=c("gene_name"))
+
+f1 <- glutarate %>%
+  select(SampleID, study_month, study_group, isPresent) %>%
+  unique() %>%
+  group_by(study_month, study_group) %>%
+  mutate(nonzero_proportion = mean(isPresent)) %>%
+  ungroup() %>% 
+  select(study_group, study_month, nonzero_proportion) %>% 
+  unique() %>% 
+  ggplot(aes(x = study_group, y = nonzero_proportion, fill = study_group)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~study_month) +
+  scale_fill_aaas(guide=FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Non zero proportion") +
+  theme(axis.text.x=element_text(angle = 30, hjust = 0.8))
+
+f2 <- glutarate %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(pathway_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas(guide=FALSE) +
+    scale_fill_aaas(guide=FALSE) +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of Lysine pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ pathway_name, scales = "free", ncol=1)
+
+
+f3 <- glutarate %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~ pathway_name, scales = "free", ncol=1) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.arrange(f1, f2, f3,
+             ncol=2, widths=c(1.2,1), heights=c(1,1),
+             layout_matrix = rbind(c(1,2), c(3,3)),
+             top = "Glutarate pathway abundance after filtering")
+```
+
+```{r, fig.width=8, fig.height=10}
+f1 <- glutarate %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(gene_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of butyrate producing pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ gene_name, scales = "free", ncol=3)
+
+f2 <- glutarate %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~gene_name, scales = "free", ncol=3) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.newpage()
+grid.arrange(f1, f2,
+             ncol=1,
+             top = "butyrate producing gene abundance in Glutarate pathway")
+```
+
+```{r, fig.width=7, fig.height=3.5}
+butyrate.contig.blast  %>%
+  filter(pathway_name %in% "Glutarate") %>%
+  filter(phylum %in% c("p__Firmicutes", "p__Proteobacteria","p__Bacteroidetes")) %>%
+  group_by(sample, gene_name, phylum) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>% 
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  filter(totalReadCounts > 0 ) %>%
+  mutate(prop = totalReadCounts / NonHostReads) %>% 
+  group_by(study_group, study_month, phylum) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ phylum, scales = "free")
+```
+```{r, fig.width=8, fig.height=4}
+toplot <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "Glutarate") %>%
+  count(gene_name, common_taxa) %>%
+  arrange(desc(n)) %>%
+  filter(n >= 5) %>%
+  .$common_taxa %>%
+  unique()
+
+butyrate.contig.blast %>%
+  filter(ButyrateReadCounts > 0) %>%
+  filter(pathway_name %in% "Glutarate") %>%
+  filter(common_taxa %in% toplot[1:3])  %>%
+  group_by(sample, gene_name, common_taxa) %>%
+  summarise(totalButyrateReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  mutate(prop = totalButyrateReadCounts / NonHostReads) %>%
+  group_by(study_group, study_month, common_taxa) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing Glutarate pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ common_taxa, scales = "free")
+```
+
+# Pyruvate
+
+There are night genes in the Acetyl-CoA pathway and we call `present` only when at least **four** genes were deteced from the metagenomics data.
+
+```{r, fig.width=7.5, fig.height=6}
+#butyrate.basic %>% filter(pathway_name %in% "Pyruvate")
+custome.levels <- c("Thl", "Hbd", "Cro", "Bcd", "But", "Buk","Ptb","EtfA","EtfB")
+
+pyruvate <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "Pyruvate") %>%
+  group_by(sample, gene_name) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  spread(gene_name, totalReadCounts, fill = 0)
+
+temp <- pyruvate %>% select(`Bcd`:Thl)
+pyruvate <- pyruvate[apply(temp, 1, function(x) sum(x > 0) ) >= 4, ]
+
+pyruvate %<>% 
+  gather(gene_name, totalReadCounts, `Bcd`:Thl) %>% 
+  mutate(gene_name = factor(gene_name, levels=custome.levels))
+
+pyruvate <- left_join(s, pyruvate, by=c("SampleID" = "sample")) %>% 
+  mutate(totalReadCounts = ifelse(is.na(totalReadCounts), 0, as.numeric(totalReadCounts))) %>%
+  mutate(isPresent = ifelse(totalReadCounts > 0, TRUE, FALSE)) %>%
+  mutate(prop = totalReadCounts/NonHostReads) %>% 
+  left_join(butyrate.basic, by=c("gene_name"))
+
+f1 <- pyruvate %>%
+  select(SampleID, study_month, study_group, isPresent) %>%
+  unique() %>%
+  group_by(study_month, study_group) %>%
+  mutate(nonzero_proportion = mean(isPresent)) %>%
+  ungroup() %>% 
+  select(study_group, study_month, nonzero_proportion) %>% 
+  unique() %>% 
+  ggplot(aes(x = study_group, y = nonzero_proportion, fill = study_group)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~study_month) +
+  scale_fill_aaas(guide=FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Non zero proportion") +
+  theme(axis.text.x=element_text(angle = 30, hjust = 0.8))
+
+f2 <- pyruvate %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(pathway_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas(guide=FALSE) +
+    scale_fill_aaas(guide=FALSE) +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of Lysine pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ pathway_name, scales = "free", ncol=1)
+
+
+f3 <- pyruvate %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~ pathway_name, scales = "free", ncol=1) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.arrange(f1, f2, f3,
+             ncol=2, widths=c(1.2,1), heights=c(1,1),
+             layout_matrix = rbind(c(1,2), c(3,3)),
+             top = "Pyruvate pathway abundance after filtering")
+```
+
+```{r, fig.width=8, fig.height=8}
+f1 <- pyruvate %>%
+  filter(totalReadCounts > 0) %>%
+  group_by(gene_name, study_group, study_month) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="",y="Relative abundance of butyrate producing pathways") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap( ~ gene_name, scales = "free", ncol=3)
+
+f2 <- pyruvate %>%
+  filter(totalReadCounts > 0) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef=10000) +
+  scale_color_aaas() +
+  scale_y_log10() +
+  theme_bw() +
+  facet_wrap(~gene_name, scales = "free", ncol=3) +
+  labs(x="",y="") 
+
+set.seed(123)
+grid.newpage()
+grid.arrange(f1, f2,
+             ncol=1,
+             top = "butyrate producing gene abundance in Pyruvate pathway")
+```
+
+```{r, fig.width=7.5, fig.height=3.5}
+butyrate.contig.blast  %>%
+  filter(pathway_name %in% "Pyruvate") %>%
+  filter(phylum %in% c("p__Firmicutes", "p__Proteobacteria","p__Bacteroidetes")) %>%
+  group_by(sample, gene_name, phylum) %>%
+  summarise(totalReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>% 
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  filter(totalReadCounts > 0 ) %>%
+  mutate(prop = totalReadCounts / NonHostReads) %>% 
+  group_by(study_group, study_month, phylum) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ phylum, scales = "free")
+```
+
+```{r, fig.width=10,  fig.height=6}
+toplot <- butyrate.contig.blast %>%
+  filter(pathway_name %in% "Pyruvate") %>%
+  count(gene_name, common_taxa) %>%
+  arrange(desc(n)) %>%
+  filter(n >= 5) %>%
+  .$common_taxa %>%
+  unique()
+
+butyrate.contig.blast %>%
+  filter(ButyrateReadCounts > 0) %>%
+  filter(pathway_name %in% "Pyruvate") %>%
+  filter(common_taxa %in% toplot[1:6])  %>%
+  group_by(sample, gene_name, common_taxa) %>%
+  summarise(totalButyrateReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>%
+  left_join(s, by=c("sample" = "SampleID")) %>%
+  mutate(prop = totalButyrateReadCounts / NonHostReads) %>%
+  group_by(study_group, study_month, common_taxa) %>% 
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab=median(prop)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("butyrate producing Pyruvate pathway abundance") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    facet_wrap( ~ common_taxa, scales = "free")
+```
+
+
+```{r byphylum, eval=FALSE}
+byplylum <- butyrate.contig.blast %>%
+  group_by(sample, phylum, gene_name) %>% #<--- should this be another way
+  #group_by(sample, phylum, pathway_name) %>% #<--- but the results are different
+  summarise(totalButyrateReadCounts = sum(ButyrateReadCounts)) %>%
+  ungroup() %>% 
+  mutate(phylum = ifelse(is.na(phylum), "Unassigned", as.character(phylum))) %>%
+  spread(phylum, totalButyrateReadCounts, fill=0)
+
+byplylum <- left_join(s, byplylum, by=c("SampleID" = "sample")) %>%
+  gather(phylum, totalButyrateReadCounts, p__Actinobacteria:p__Verrucomicrobia)  %>%
+  mutate(totalButyrateReadCounts =ifelse(is.na(totalButyrateReadCounts), 0, as.numeric(totalButyrateReadCounts))) %>%
+  mutate(prop = totalButyrateReadCounts/NonHostReads)
+
+
+byplylum %>%
+  filter(! phylum %in% c("p__Fusobacteria")) %>%
+  group_by(phylum, study_group, study_month) %>%
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n()) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=mean_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = mean_ab + se_ab, ymin = mean_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_log10() +
+    labs(x="Study month",y="Relative abundance of butyrate producing genes") +
+    ggtitle("Total butyrate producing gene annotation") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~phylum, scale="free_y", ncol = 2)
+
+
+byplylum %>% 
+  filter(phylum %in% c("p__Bacteroidetes", "p__Firmicutes",  "p__Proteobacteria")) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_quasirandom() +
+  geom_boxplot(coef = 100000) +
+  theme_bw() +
+  scale_y_log10() +
+  ggtitle("estimated butyrate producing gene abundance from shotgun metagenomics data") +
+  scale_color_aaas() +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  facet_wrap(~phylum, scale="free_y", ncol = 1)
+```

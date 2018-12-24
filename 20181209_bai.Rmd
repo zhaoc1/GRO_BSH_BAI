@@ -1,0 +1,563 @@
+---
+title: "bai genes annotation (contigs)"
+author: "Chunyu Zhao"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+geometry: "left=1cm,right=1cm,top=2cm,bottom=2cm"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dpi=100,
+  fig.align = "center",
+  fig.width = 8,
+  cache.lazy = FALSE,
+  dev=c("png", "pdf"),
+  warning=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(readr)
+library(reshape2)
+library(ggbeeswarm)
+library(scales)
+library(stringr)
+library(RColorBrewer)
+library(viridis)
+library(pander)
+library(magrittr)
+library(forcats)
+library(ggbeeswarm)
+library(ggsci)
+library(scales)
+
+library(gridExtra)
+library(grid)
+
+library(pheatmap)
+library(readr)
+
+library(broom)
+source("new_helper.R")
+```
+
+# 20181209
+
+It has become standard practice to use the bai genes as markers to predict the level of the DCA in a gut community. DCA production has been shown to limit the outgrowth of the enteric pathogen Clostridium difficile [9]. 
+
+### bai operons:
+
+- gene clusters databases: collected 3 Clostridium species with known bai-operon; so for those contigs with known bai operon, we should annotate the genes.
+
+- hub genes: *baiCD* and *baiH* genes.
+
+### motivation 
+
+Direct functional predictions based on gene homology alone can commonly results in misannotations if genes with distinct function share regions of high similarity, as specifically described for butyrate producing genes `but` and `buk`. 
+
+*also*, if the reads blasted to the genes covers enough, then the overlap between the reads should give us enough overlap information to assemble them.
+
+Targeting the whole pathway for function predictions is hence a robust way to circumvent difficulties associated with the analysis based on specific genes only.
+
+- two benefits of identify bai genes based on contigs annotation:
+
+1) check whether the *whole* gene of interest is covered. (which is a limitation for reads blast approach)
+2) virsualize things that are close together, which is operon, given long enough contigs.
+
+- low diversity samples: easier to assemble
+
+## bai meta
+
+```{r}
+bai.meta <- read_delim("sunbeam_databases/dbs/bai.operon_20180801.txt", delim="\t", col_names = F) %>%
+  dplyr::rename(baiGene = X4, baiSpecies = X2)
+
+## improve me
+sample.id <- "GRO_136"
+bai_dir <- file.path("sunbeam_output/annotation/sbx_gene_clusters/bai.operon_20180801/")
+bai.gene.len <- read_delim(file.path(bai_dir, paste(sample.id, "_contigs.blastx", sep="")), delim="\t", col_names=F) %>%
+  set_colnames(c("qseqid", "sseqid", "pident", "qlen","slen","alnLen", "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "e_value", "bit_score")) %>% 
+  group_by(sseqid, slen) %>% 
+  filter(row_number() == 1) %>% 
+  ungroup() %>% 
+  select(sseqid, slen) %>% 
+  dplyr::rename(baiGeneLen = slen) %>% 
+  mutate(baiGeneLen = 3 * baiGeneLen) 
+
+bai.meta %<>%
+  left_join(bai.gene.len, by = c("X1" = "sseqid"))
+
+bai.meta %>% select(baiGene, baiSpecies, baiGeneLen) %>%
+  spread(baiSpecies, baiGeneLen, fill = 0) %>%
+  pander(caption="bai genes length", split.table=Inf)
+
+bai.levels <- c("barA","baiB", "baiCD", "baiE", "baiA", "baiF", "baiG", "baiH", "baiI")
+
+bai.gene.len.short <- bai.meta %>%
+  select(baiGene, baiGeneLen) %>%
+  group_by(baiGene) %>%
+  summarise(medianBAIlen = median(baiGeneLen)) 
+```
+
+```{r, eval=FALSE}
+gc_dir <- file.path("sunbeam_output/annotation/sbx_gene_clusters/bai.operon_20180801/")
+
+read_bsh_blastx <- function(sample.id, contigs.bacteria.blastn){
+  #print(sample.id)
+  
+  contigs.gc <- read_delim(file.path(gc_dir, paste(sample.id, "_contigs.blastx", sep="")), delim="\t", col_names=F)
+  
+  if (nrow(contigs.gc) == 0 )
+    return(data.frame(qseqid = NA))
+  
+  contigs.gc %<>% set_colnames(c("qseqid", "sseqid", "pident", "qlen","slen","alnLen", "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "e_value", "bit_score"))
+  
+  contigs.gc %<>% mutate(scov = alnLen/slen)
+  
+  contigs.gc %<>% left_join(bai.meta, by=c("sseqid" = "X1")) 
+  
+  return(contigs.gc)
+}
+
+## smart rbind => bind_rows
+samples <- sub("_contigs.blastx", "", list.files(gc_dir))
+bai.contig.blast <- bind_rows(lapply(1:length(samples), function(x) data.frame(sample = samples[x], read_bsh_blastx(samples[x], contigs.bacteria.blastn))))
+
+saveRDS(bai.contig.blast, file="bai_blastx_20181209.rds")
+```
+
+## rick's Q: how similar the bai genes and bsh genes are.
+
+"take genes already known, blast against each other, and how similar they are"
+
+- /home/chunyu/20180725/20181001_bai_blastp: I blastp known bai genes to the bai database and now let's part the results.
+
+```{r}
+read_blastp <- function(filepath){
+  sample_id <- sub(".blastp", "", basename(filepath))
+  blastp <- read_delim(filepath, delim="\t", col_names = F)
+  if (nrow(blastp) == 0){
+    print(paste("empty blastp search for", sample_id))
+    return(data.frame(qseqid=NA))
+  }
+  
+  blastp %<>% set_colnames(c("qseqid", "sseqid", "pident", "qlen","slen","length", "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "e_value", "bit_score"))
+  
+}
+
+blastp.dir <- "20181001_bai_blastp/"
+bai.ref.blastp <- data_frame(FileName = list.files(blastp.dir, pattern=".blastp")) %>%
+  group_by(FileName) %>%
+  do(read_blastp(file.path(blastp.dir, .$FileName))) %>%
+  ungroup() %>%
+  mutate(SampleID = sub(".blastp", "", FileName)) %>%
+  filter(! qseqid == sseqid)
+
+bai.ref.blastp %<>%
+  left_join(bai.meta, by=c("sseqid" = "X1")) %>%
+  dplyr::rename(sseqname = baiGene) %>%
+  left_join(bai.meta, by=c("qseqid" = "X1")) %>%
+  dplyr::rename(qseqname = baiGene)
+
+bai.ref.blastp %>%
+  filter(sseqname == qseqname) %>%
+  filter(!is.na(sseqname)) %>%
+  merge(bai.gene.len.short, by.x = "sseqname", by.y = "baiGene") %>%
+  mutate(baiLabel = paste(sseqname, "(", medianBAIlen, "bps)")) %>%
+  ggplot(aes(x = pident, fill = sseqname)) + 
+  geom_histogram() +
+  scale_fill_npg() +
+  facet_wrap(~baiLabel, scale="free_y", ncol=3) +
+  ggtitle("Ident dist for refseq bai gene familes") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+bai.ref.blastp %>%
+  mutate(scov = length / slen) %>%
+  filter(sseqname == qseqname) %>%
+  filter(!is.na(sseqname)) %>%
+  merge(bai.gene.len.short, by.x = "sseqname", by.y = "baiGene") %>%
+  mutate(baiLabel = paste(sseqname, "(", medianBAIlen, "bps)")) %>%
+  ggplot(aes(x = scov, fill = sseqname)) +
+  geom_histogram() +
+  scale_fill_npg() +
+  facet_wrap(~baiLabel, scale="free_y", ncol=3) +
+  ggtitle("distribution for bai gene coverage") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+## pident and cov
+
+```{r}
+bai.contig.blast <- readRDS("bai_blastx_20181209.rds")
+
+bai.contig.blast %>%
+  merge(bai.gene.len.short, by.x = "baiGene", by.y = "baiGene") %>%
+  mutate(baiLabel = paste(baiGene, "(", medianBAIlen, "bps)")) %>%
+  ggplot(aes(x = pident, fill = baiGene)) + 
+  geom_histogram() +
+  scale_fill_npg() +
+  facet_wrap(~baiLabel, scale="free_y", ncol=3) +
+  ggtitle("distribution for ident") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  geom_vline(xintercept = 30, colour = "red", linetype = 2)
+
+bai.contig.blast %>%
+  merge(bai.gene.len.short, by.x = "baiGene", by.y = "baiGene") %>%
+  mutate(baiLabel = paste(baiGene, "(", medianBAIlen, "bps)")) %>%
+  ggplot(aes(x = scov, fill = baiGene)) +
+  geom_histogram() +
+  scale_fill_npg() +
+  facet_wrap(~baiLabel, scale="free_y", ncol=3) +
+  ggtitle("distribution for bai gene coverage") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  geom_vline(xintercept = 0.6, colour = "red", linetype = 2)
+
+pident.cutoff <- 30
+scov.cutoff <- 0.6
+
+bai.contig.blast %<>% 
+  filter(pident >= pident.cutoff) %>%
+  filter(scov >= scov.cutoff) 
+
+saveRDS(bai.contig.blast, file="bai_blastx_filtered_20181209.rds")
+```
+
+## per base coverage
+
+```{r, eval=FALSE}
+## reading per base coverage file takes a reeeeeaaaaallllly long time.
+get_per_base_cov <- function(sample.id, bsh.contig.blast){
+  print(sample.id)
+  .bsh <- bsh.contig.blast %>% filter(sample %in% sample.id)
+  
+  depth_fp <- "coverage"
+  per.base.cov <- read_delim(file.path(depth_fp, paste(sample.id, ".depth", sep="")), delim="\t", col_names = F)
+  colnames(per.base.cov) <- c("qseqid", "base", "cov")
+  
+  qseqids <- unique(.bsh$qseqid)
+  
+  perbase <- do.call(rbind, lapply(1:length(qseqids), function(x){
+    qseq <- qseqids[x]
+    .bsh %<>% filter(qseqid %in% qseq) %>% 
+      mutate(qmin = pmin(qstart, qend), qmax = pmax(qstart, qend))
+    
+    qstart <- .bsh %>% filter(qseqid %in% qseq) %>% .$qmin
+    qend <- .bsh %>% filter(qseqid %in% qseq) %>% .$qmax
+    
+    per.base.cov %>%
+      filter(qseqid %in% qseq) %>%
+      filter(base >= qstart & base <= qend) %>% 
+      summarise(perbaseSum= sum(cov), perbaseMedian = median(cov), perbaseSd = sd(cov), perbaseLen = n(), perbaseMin = min(cov), perbaseMax = max(cov), perbaseMean = mean(cov)) %>%
+      mutate(qseqid = qseq) %>%
+      select(qseqid, everything())
+  }))
+}
+
+bai.contig.blast <- readRDS("bai_blastx_filtered_20181209.rds")
+samples <- unique(bai.contig.blast$sample)
+bai.per.base <- lapply(1:length(samples), function(x) data.frame(sample= samples[x], get_per_base_cov(samples[x], bai.contig.blast)))
+
+bai.per.base.df <- bind_rows(bai.per.base)
+
+saveRDS(bai.per.base.df, file="bai_perbase_20181208.rds")
+```
+
+# 20181210
+
+```{r}
+bai.contig.blast <- readRDS("bai_blastx_filtered_20181209.rds")
+
+## for each contig, we keep the best hit for each gene
+bai.contig.blast %<>%
+  group_by(sample, qseqid, baiGene) %>%
+  arrange(desc(bit_score)) %>%
+  filter(row_number() == 1) %>%
+  ungroup()
+
+## game time, lets find the contig with themost 
+contig.largest <- bai.contig.blast %>%
+  group_by(sample,qseqid) %>%
+  dplyr::count() %>%
+  arrange(desc(n)) %>%
+  head(n = 1)
+
+bai.contig.blast %<>% mutate(baiGene = factor(baiGene, levels = bai.levels))
+```
+
+```{r}
+blastn.common <- readRDS("blastn_common_20181208.rds") %>%
+  filter(species == common_taxa) %>%
+  select(sample, qseqid, superkingdom:common_taxa) %>%
+  ungroup()
+
+bai.contig.blast %<>%
+  filter(qlen >= 500) %>%
+  left_join(blastn.common, by=c("sample", "qseqid"))
+
+bai.contig.blast %>%
+  filter(is.na(phylum)) %>%
+  dplyr::count(baiGene) %>%
+  pander(caption = "contigs with no phylum annot")
+ 
+contigs.coverage <- read_delim("sunbeam_output/coverage/contigs_coverage.csv", delim=",")
+bai.contig.blast %<>%
+  left_join(contigs.coverage, by=c("sample"="sample", "qseqid"="contig"))
+
+bai.per.base.df <- readRDS("bai_perbase_20181208.rds")
+bai.contig.blast %<>%
+  left_join(bai.per.base.df, by=c("sample"="sample", "qseqid"="qseqid"))
+
+bai.contig.blast %<>% 
+  filter(!is.na(phylum))
+```
+
+## a complete bai operon detected
+
+```{r, fig.height=2, fig.width=10}
+sample.id <- contig.largest$sample
+contig.largest <- contig.largest$qseqid
+
+contig.toplot <- bai.contig.blast %>%
+  mutate(common_taxa = as.character(common_taxa)) %>%
+  filter(sample %in% sample.id) %>%
+  filter(qseqid %in% contig.largest)
+
+species <- contig.toplot$common_taxa %>% unique()
+contig.toplot %>%
+  mutate(xmin = pmin(qstart, qend), xmax = pmax(qstart, qend)) %>%
+  ggplot() + 
+  geom_rect(aes(xmin = xmin, xmax = xmax, fill=pident), ymin = -Inf, ymax = Inf, color = NA, alpha = 0.9) + 
+  geom_text(aes(x = xmin, y = 0.01, label=baiGene), size = 3, vjust = 0, hjust = 0, check_overlap = FALSE) +
+  geom_vline(aes(xintercept = as.numeric(xmin)), colour = "grey50", alpha = 0.8) +
+  ylim(c(0, 0.1)) +
+  theme_bw() +
+  scale_fill_viridis(alpha=0.9, discrete=FALSE) +
+  ggtitle(paste("complete bai operon annotation for \n", sample.id, "\n(contig ", contig.largest,", ", species,")", sep="")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(x = "bai gene position in assembled contig", y = "") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          axis.text.y=element_blank(), axis.ticks.y = element_blank())
+```
+
+```{r}
+bai.contig.blast %<>%
+  select(sample, qseqid, sseqid, baiGene, alnLen, baiGeneLen, phylum:common_taxa, perbaseSum, perbaseLen, perbaseMean, perbaseMedian, median, length)
+
+readlength <- 126
+
+toadd <- bai.contig.blast %>%
+  group_by(sample, qseqid, baiGene) %>%
+  summarise(BAIReadCounts = sum(perbaseSum)/readlength) %>%
+  ungroup()
+
+bai.contig.blast %<>% 
+  left_join(toadd, by=c("sample", "qseqid", "baiGene")) 
+```
+
+## metadata
+
+```{r}
+s <- read.table(file.path("sunbeam_output/mennella_metadata_20161206.txt"), sep="\t", header = TRUE) %>%
+  dplyr::select(CHOPSampleID, SubjectID, study_month, study_group, CHILD_GENDER, CHILD_RACE, CHILD_NORM.RAPID.GROWTH, TAS2r38) %>%
+  dplyr::rename(SampleID = CHOPSampleID) %>%
+  mutate(SampleID = sub("-","_", SampleID))
+
+read_counts <- read.table(file.path("sunbeam_output/preprocess_summary.tsv"), header = T) %>%
+  mutate(Samples = sub(".json", "", Samples, fixed = TRUE)) %>%
+  mutate(low_quality = (fwd_only + rev_only + dropped) / input) %>%
+  mutate(human = true / input) %>%
+  mutate(non_human = false / input) %>%
+  dplyr::rename(HostReads=true, NonHostReads=false, SampleID = Samples)
+
+s <- merge(s, read_counts, by="SampleID") %>%
+  mutate(SubjectID = as.factor(SubjectID)) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  mutate(study_group = as.factor(study_group)) %>%
+  mutate(study_month = as.factor(study_month)) #<- just for visualization
+
+s %<>% 
+  #filter(! study_month  %in% 0.5) %>%
+  mutate(study_group = fct_recode(study_group, "CMF"="A", "EHF"="B"))
+
+bai.contig.blast %<>% filter(sample %in% s$SampleID)
+```
+
+
+```{r}
+saveRDS(bai.contig.blast, file="bai.contig.blast_20181212.rds")
+```
+
+## bysample
+
+```{r fig.width=8, fig.height=5}
+bysample <- bai.contig.blast %>%
+  group_by(sample, baiGene) %>%
+  summarise(totalBAIReadCounts = sum(BAIReadCounts)) %>%
+  ungroup() %>%
+  spread(baiGene, totalBAIReadCounts, fill = NA) %>%
+  gather(baiGene, totalBAIReadCounts, barA: baiI) %>%
+  mutate(totalBAIReadCounts = ifelse(is.na(totalBAIReadCounts), 0, as.numeric(totalBAIReadCounts))) %>%
+  mutate(baiGene = factor(baiGene, levels = bai.levels))
+
+bysample <- left_join(s, bysample, by=c("SampleID"= "sample")) %>%
+  mutate(BAIpresent = ifelse(totalBAIReadCounts > 0, TRUE, FALSE)) %>%
+  mutate(prop = totalBAIReadCounts/NonHostReads)
+
+bysample %>%
+  select(SampleID, study_month, study_group, baiGene, BAIpresent) %>%
+  unique() %>%
+  group_by(study_month, study_group, baiGene) %>%
+  mutate(nonzero_proportion = mean(BAIpresent)) %>%
+  ungroup() %>% 
+  select(study_group, study_month, baiGene, nonzero_proportion) %>% 
+  unique() %>% 
+  ggplot(aes(x = study_group, y = nonzero_proportion, fill = study_group)) +
+  geom_bar(stat = "identity") +
+  facet_grid(study_month ~ baiGene) +
+  scale_fill_aaas() +
+  theme_bw() +
+  labs(x = "", y = "Non zero proportion") +
+  theme(axis.text.x=element_text(angle = 30, hjust = 0.8)) +
+  ggtitle("Non zero proportion of samples with bai genes") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+bysample %>%
+  filter(totalBAIReadCounts > 0 ) %>%
+  group_by(baiGene, study_group, study_month) %>%
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n(), median_ab = median(prop)) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=median_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = median_ab + se_ab, ymin = median_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of bai genes") +
+    ggtitle("Total BAI gene annotation") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~baiGene, scales = "free")
+```
+
+### all five time points linear mixed effects
+
+```{r}
+library(nlme)
+
+logit <- function (p) log(p / (1 - p))
+
+bysample %<>% mutate(LogProp = log10(prop + 1e-6))
+
+lme_models <- bysample %>%
+  group_by(baiGene) %>%
+  do(mod = lme(LogProp ~ study_group * study_month, random = ~ 1 | SubjectID, data=.)) %>%
+  ungroup()
+
+tidy_lme <- function(mod) {
+  mod <- summary(mod)
+  data.frame(term  = rownames(mod$tTable), mod$tTable, row.names=NULL)
+}
+
+summaries <- lapply(1:length(lme_models$mod), function(x) data.frame(tidy_lme(lme_models$mod[[x]]), bai=lme_models$baiGene[[x]]))
+
+summaries_df <- do.call(rbind,summaries) %>% filter(term != '(Intercept)')
+
+summaries_df %<>%
+  filter(! is.na(p.value)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>% 
+  filter(p.value <= 0.05) %>% 
+  dplyr::select(bai, everything()) %>%
+  arrange(term) %>%
+  mutate(term = gsub("study_group", "", term))
+
+pander(summaries_df, keep.line.breaks=T, split.table = Inf, caption="lme result")
+```
+
+### formula effect at 4.5 month
+
+```{r}
+s_toTest <- bysample %>% filter(study_month %in% 4.5) %>% droplevels()
+
+lme_models <- s_toTest %>%
+  group_by(baiGene) %>%
+  do(tidy(lm(LogProp ~ study_group, data=.))) %>% 
+  ungroup()
+
+lme_models %<>%
+  filter(term != '(Intercept)') %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value <= 0.05) %>%
+  mutate(term = gsub("study_group", "CMF-", term))
+
+options(scipen=1, digits=3)
+pander(lme_models, keep.line.breaks=T, split.table = Inf, caption="lm result")
+```
+
+
+## byphylum
+
+- FOR further studies, we need to figure out why we have phylum == na
+
+```{r, fig.width=8, fig.height=4}
+byplylum <- bai.contig.blast %>%
+  group_by(sample, phylum, baiGene) %>%
+  summarise(totalBAIReadCounts = sum(BAIReadCounts)) %>%
+  ungroup() %>% 
+  mutate(phylum = ifelse(is.na(phylum), "Unassigned", as.character(phylum))) %>%
+  spread(phylum, totalBAIReadCounts, fill=0)
+
+byplylum <- left_join(s, byplylum, by=c("SampleID" = "sample")) %>%
+  gather(phylum, totalBAIReadCounts, p__Actinobacteria:p__Firmicutes, p__Proteobacteria)  %>%
+  mutate(totalBAIReadCounts =ifelse(is.na(totalBAIReadCounts), 0, as.numeric(totalBAIReadCounts))) %>%
+  mutate(prop = totalBAIReadCounts/NonHostReads)
+
+byplylum %>% 
+  filter(phylum %in% c("p__Firmicutes", "p__Proteobacteria")) %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_boxplot(coef = 100000) +
+  geom_quasirandom() +
+  theme_bw() +
+  scale_y_continuous(labels=scales:::percent) +
+  scale_y_log10() +
+  ggtitle("estimated BAI gene abundance from shotgun metagenomics data") +
+  scale_color_aaas() +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  facet_wrap(~phylum, scale="free_y", ncol = 2)
+
+byplylum %>%
+  group_by(phylum, study_group, study_month) %>%
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n()) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=mean_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = mean_ab + se_ab, ymin = mean_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    scale_y_log10() +
+    labs(x="Study month",y="Relative abundance of BSH genes") +
+    ggtitle("Total BSH gene annotation") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~phylum, scale="free_y", ncol = 2)
+```

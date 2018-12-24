@@ -1,0 +1,613 @@
+---
+title: "BSH genes annotation (contigs)"
+author: "Chunyu Zhao"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+geometry: "left=1cm,right=1cm,top=2cm,bottom=2cm"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dpi=100,
+  fig.align = "center",
+  fig.width = 8,
+  cache.lazy = FALSE,
+  dev=c("png", "pdf"),
+  warning=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(readr)
+library(reshape2)
+library(ggbeeswarm)
+library(scales)
+library(stringr)
+library(RColorBrewer)
+library(viridis)
+library(pander)
+library(magrittr)
+library(forcats)
+library(ggbeeswarm)
+library(ggsci)
+library(scales)
+
+library(gridExtra)
+library(grid)
+
+library(pheatmap)
+library(readr)
+
+source("new_helper.R")
+```
+
+# 20181208
+
+## taxonomic annotation
+
+```{r keep the best hits, eval=FALSE}
+read_blastn_refseq <- function(filepath) {
+  
+  print(filepath)
+  sample_id <- sub("*.blastn", "", basename(filepath))
+  
+  blastn <- read_delim(filepath, delim="\t", col_names = F)
+  
+  if (nrow(blastn) == 0){
+    print(paste("empty blastn search for", sample_id))
+    return(data.frame(sample = sample_id, qseqid=NA))
+  }
+  
+  blastn %<>%
+    set_colnames(c("qseqid", "sseqid", "pident", "qlen","slen","length", "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "e_value", "bit_score"))
+  
+  ## file too big, we need to do some filtering
+  blastn %<>%
+    mutate(qcov = length / qlen) %>%
+    filter(qlen >= 500) %>%
+    filter(qcov >= 0.25)
+  
+  ## keep all the good `bit_score`
+  blastn %<>%
+    group_by(qseqid) %>%
+    filter(bit_score == max(bit_score)) %>%
+    ungroup()
+  
+   if (nrow(blastn) == 0){
+    print(paste("empty blastn search for", sample_id))
+    return(data.frame(sample = sample_id, qseqid=NA))
+  }
+  
+  data.frame(sample = sample_id, blastn)
+}
+
+
+summary_dir <- "sunbeam_output/annotation/bacteria/contigs"
+summary_files <- list.files(summary_dir)
+db <- "bacteria"
+
+blastn <- do.call(rbind,lapply(1:length(summary_files),
+                               function(x) read_blastn_refseq(file.path(summary_dir, summary_files[x])))) 
+
+saveRDS(blastn, file="blastn_raw_20181208_by_bitscore.rds")
+```
+
+## common ancestor
+
+```{r, eval=FALSE}
+blastn <- readRDS("blastn_raw_20181208_by_bitscore.rds")
+
+## load in the taxonomizr
+library(taxonomizr)
+library(data.table)
+
+taxaNodes<-read.nodes('/home/chunyu/biodata/taxonomizr_20170925/nodes.dmp')
+taxaNames<-read.names('/home/chunyu/biodata/taxonomizr_20170925/names.dmp')
+accessionTaxasql <- "/home/chunyu/biodata/taxonomizr_20170925/accessionTaxa.sql"
+
+taxaId<-accessionToTaxa(c("LN847353.1","AL079352.3"),accessionTaxasql)
+print(taxaId)
+
+blastn %<>%
+  dplyr::mutate(taxaID = accessionToTaxa(sseqid, accessionTaxasql)) 
+blastn <- cbind(blastn, getTaxonomy(blastn$taxaID,taxaNodes,taxaNames))
+
+saveRDS(blastn, file="blastn_taxonomizr_20181208.rds")
+
+## this is a big problem... 
+blastn %<>% filter(! is.na(taxaID))
+
+## same bit score, different accession number but same species
+blastn %<>%
+  group_by(sample, qseqid, species) %>%
+  filter(row_number() == 1) %>%
+  ungroup()
+
+## add some indicators
+blastn %<>% 
+  mutate(species = paste("s", species, sep="__")) %>%
+  mutate(genus = paste("g", genus, sep="__")) %>%
+  mutate(family = paste("f", family, sep="__")) %>%
+  mutate(order = paste("o", order, sep="__")) %>%
+  mutate(class = paste("c", class, sep="__")) %>%
+  mutate(phylum = paste("p", phylum, sep="__")) 
+
+
+## same bit score, different species 
+## it's really not fair to use any species. instead let's find the so called common ancestor
+first_word <- function (x) sapply(strsplit(x, " "), `[`, 1)
+find_common_ancestor <- function(test_taxonomy) {
+  temp <- as.character(test_taxonomy[[1,names(tail(which(lapply(apply(test_taxonomy, 2, unique), length) == 1), n=1))]])
+  if (is.null(temp)) {
+    temp <- "NA"
+  }
+  temp
+}
+taxa_headers <- c("superkingdom", "phylum", "class", "order", "family", "genus", "species")
+
+blastn.common <- blastn %>%
+  group_by(sample, qseqid) %>%
+  do(common_taxa = find_common_ancestor(.[taxa_headers])) %>% 
+  ungroup()
+
+blastn %<>%
+  left_join(blastn.common, by=c("sample", "qseqid"))
+
+saveRDS(blastn, file="blastn_common_20181208.rds")
+```
+
+## add bsh meta
+
+```{r, eval=FALSE}
+bsh.meta <- read_delim("sunbeam_databases/dbs/bsh_20180214.txt",  delim="\t") %>% select(accession, everything())
+
+
+# I want to change the format a bit, save the raw blastx results
+gc_dir <- file.path("sunbeam_output/annotation/sbx_gene_clusters/bsh_20180214/")
+
+read_bsh_blastx <- function(sample.id, contigs.bacteria.blastn){
+  #print(sample.id)
+  
+  contigs.gc <- read_delim(file.path(gc_dir, paste(sample.id, "_contigs.blastx", sep="")), delim="\t", col_names=F)
+  
+  if (nrow(contigs.gc) == 0 )
+    return(data.frame(qseqid = NA))
+  
+  contigs.gc %<>% set_colnames(c("qseqid", "sseqid", "pident", "qlen","slen","alnLen", "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "e_value", "bit_score"))
+  
+  contigs.gc %<>% mutate(scov = alnLen/slen)
+  
+  contigs.gc %<>% left_join(bsh.meta, by=c("sseqid" = "accession")) 
+    
+  return(contigs.gc)
+}
+
+## smart rbind => bind_rows
+samples <- sub("_contigs.blastx", "", list.files(gc_dir))
+bsh.contig.blast <- bind_rows(lapply(1:length(samples), function(x) data.frame(sample = samples[x], read_bsh_blastx(samples[x], contigs.bacteria.blastn))))
+
+saveRDS(bsh.contig.blast, file="bsh_blastx_20181208.rds")
+```
+
+## per base coverage
+
+```{r, eval=FALSE}
+## reading per base coverage file takes a reeeeeaaaaallllly long time.
+get_per_base_cov <- function(sample.id, bsh.contig.blast){
+  ## 20181003
+  #sample.id <- "s.147.IBD.Therapy.Feces.Week.8"
+  
+  print(sample.id)
+  .bsh <- bsh.contig.blast %>% filter(sample %in% sample.id)
+  
+  depth_fp <- "sunbeam_output/coverage"
+  per.base.cov <- read_delim(file.path(depth_fp, paste(sample.id, ".depth", sep="")), delim="\t", col_names = F)
+  colnames(per.base.cov) <- c("qseqid", "base", "cov")
+  
+  qseqids <- unique(.bsh$qseqid)
+  
+  perbase <- do.call(rbind, lapply(1:length(qseqids), function(x){
+    qseq <- qseqids[x]
+    .bsh %<>% filter(qseqid %in% qseq) %>% 
+      mutate(qmin = pmin(qstart, qend), qmax = pmax(qstart, qend))
+    
+    qstart <- .bsh %>% filter(qseqid %in% qseq) %>% .$qmin
+    qend <- .bsh %>% filter(qseqid %in% qseq) %>% .$qmax
+    
+    per.base.cov %>%
+      filter(qseqid %in% qseq) %>%
+      filter(base >= qstart & base <= qend) %>% 
+      summarise(perbaseSum= sum(cov), perbaseMedian = median(cov), perbaseSd = sd(cov), perbaseLen = n(), perbaseMin = min(cov), perbaseMax = max(cov), perbaseMean = mean(cov)) %>%
+      mutate(qseqid = qseq) %>%
+      select(qseqid, everything())
+  }))
+}
+
+samples <- unique(bsh.contig.blast$sample)
+bsh.per.base <- lapply(1:length(samples), function(x) data.frame(sample= samples[x], get_per_base_cov(samples[x], bsh.contig.blast)))
+
+bsh.per.base.df <- do.call(rbind, bsh.per.base)
+
+saveRDS(bsh.per.base.df, file="bsh_perbase_20181208.rds")
+```
+
+- 20181120: added `sum` from the `per.base.df` data frame to sunbeam/coverage.rules.
+
+```{r per base coverage for contigs, eval=FALSE}
+get_per_base_cov_contig <- function(filename){
+  print(filename)
+  per.base.cov <- read_delim(filename, delim="\t", col_names = F)
+  colnames(per.base.cov) <- c("qseqid", "base", "cov")
+  
+  per.base.cov %>%
+    group_by(qseqid) %>%
+    summarise(perbaseSum= sum(cov), perbaseMedian = median(cov), perbaseSd = sd(cov), perbaseLen = n(), perbaseMin = min(cov), perbaseMax = max(cov), perbaseMean = mean(cov)) %>%
+    ungroup()
+}
+
+depth_fp <- "sunbeam_output_20180731/sbx_contigs/reports"
+suffix_pattern <- ".depth"
+
+per.base.df <- data_frame(FileName = list.files(depth_fp, pattern=suffix_pattern)) %>%
+  mutate(SampleID = sub(suffix_pattern, "", FileName)) %>%
+  group_by(FileName) %>%
+  do(get_per_base_cov_contig(file.path(depth_fp, .$FileName))) %>%
+  ungroup()
+  
+saveRDS(per.base.df, file="contigs.per.base.df_20181120.rds")
+```
+
+# 20181209
+
+## bsh gene databases
+
+```{r}
+bsh.meta <- read_delim("sunbeam_databases/dbs/bsh_20180214.txt",  delim="\t") %>% select(accession, everything())
+
+## need to read in the fasta file for the length of bsh genes
+library(Kmisc)
+library(seqinr)
+library("Biostrings")
+
+fasta.files <- "sunbeam_databases/dbs/bsh_20180214.fasta"
+s <- readBStringSet(fasta.files)
+seqs <- list()
+for (i in 1:length(s)){
+  curr.seq <- as.character(s[i])
+  curr.name <- sub("(.*)\\|(.*)", "\\1", names(curr.seq))
+  curr.name <- str_extract(curr.name, "[^ ]*")
+  seqs[[curr.name]] <- width(s[i])
+}
+seqs <- do.call(rbind, seqs) %>% as.data.frame()
+seqs$accession <- rownames(seqs)
+seqs %<>% dplyr::rename(bshGeneLength = V1)
+
+
+bsh.meta %<>%
+  left_join(seqs, by=c("accession")) %>% 
+  dplyr::rename(BSHspecies = species) 
+```
+
+## bsh contigs set up pident and scov cutoff 
+
+### (1) BSH distributuion for all raw blastx results
+
+- **task**: detect whether out shotgun data encode BSH genes or not; don't care species encode that genes for now.
+
+```{r, fig.width=6, fig.height=7}
+bsh.contig.blast <- readRDS("bsh_blastx_20181208.rds")
+
+bsh.contig.blast %>%
+  filter(!is.na(status)) %>%
+  ggplot(aes(x = pident, fill = status)) + 
+  geom_histogram() +
+  scale_fill_npg() +
+  facet_wrap(~status, scale="free_y", ncol=1) +
+  ggtitle("distribution for ident") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  geom_vline(xintercept = 45, colour = "red", linetype = 2)
+
+bsh.contig.blast %>%
+  filter(!is.na(status)) %>%
+  ggplot(aes(x = scov, fill = status)) +
+  geom_histogram() +
+  scale_fill_npg() +
+  facet_wrap(~status, scale="free_y", ncol=1) +
+  ggtitle("distribution for bsh gene coverage") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  geom_vline(xintercept = 0.85, colour = "red", linetype = 2)
+
+pident.cutoff <- 45
+scov.cutoff <- 0.85
+```
+
+### (2) filter threshold
+
+- set `pident.cutoff` to `r pident.cutoff` and `scov.cutoff` to `r scov.cutoff` for the downstream analysis.
+
+```{r}
+bsh.contig.blast %<>%
+  filter(scov >= scov.cutoff) %>%
+  filter(pident >= pident.cutoff)
+```
+
+### (3) Keep top hit
+
+Since we are only interested in the presence/absence of the BSH genes, it works towards our benefits if the one contig blasted to multiple BSH genes, meaning highly homologoues genes. **Unless*, the same contig mapped to bash `encode BSH` and `no encode BSH` groups.
+
+```{r}
+bsh.contig.blast %<>%
+  mutate(BSHgroup = ifelse( status %in% "encode no BSH", "NObsh", "YESbsh")) %>%
+  group_by(sample, qseqid, BSHgroup) %>%
+  arrange(desc(bit_score)) %>%
+  filter(row_number() == 1) %>%
+  ungroup()
+
+## look at those cases we need to filter out
+bsh.contig.blast %>%
+  group_by(sample, qseqid) %>% 
+  filter(n() > 1) %>% 
+  select(sample, qseqid, status) %>%
+  arrange(sample) %>%
+  pander(caption = "contigs with paralogs, need to be careful")
+
+bsh.contig.blast %<>%
+  group_by(sample, qseqid) %>% 
+  arrange(desc(bit_score)) %>%
+  filter(n() == 1) %>%
+  ungroup()
+```
+
+## common ancestor
+
+```{r}
+blastn.common <- readRDS("blastn_common_20181208.rds") %>%
+  filter(species == common_taxa) %>%
+  select(sample, qseqid, superkingdom:common_taxa) %>%
+  ungroup()
+
+bsh.contig.blast %<>%
+  left_join(blastn.common, by=c("sample", "qseqid"))
+
+bsh.per.base.df <- readRDS("bsh_perbase_20181208.rds")
+contigs.coverage <- read_delim("sunbeam_output/coverage/contigs_coverage.csv", delim=",")
+
+bsh.contig.blast %<>%
+  left_join(bsh.per.base.df, by=c("sample"="sample", "qseqid"="qseqid"))
+
+bsh.contig.blast %<>%
+  left_join(contigs.coverage, by=c("sample"="sample", "qseqid"="contig"))
+
+bsh.contig.blast %<>%
+  select(sample, qseqid, sseqid, BSHgroup, alnLen, slen, phylum:common_taxa, perbaseSum, perbaseLen, perbaseMean, perbaseMedian, median, length)
+
+bsh.contig.blast %<>% 
+  filter(!is.na(phylum))
+```
+
+```{r}
+readlength <- 126
+
+toadd <- bsh.contig.blast %>%
+  group_by(sample, qseqid) %>%
+  summarise(BSHReadCounts = sum(perbaseSum)/readlength) %>%
+  ungroup()
+
+bsh.contig.blast %<>% 
+  left_join(toadd, by=c("sample", "qseqid")) 
+```
+
+
+```{r}
+saveRDS(bsh.contig.blast, file="bsh.contig.blast_20181212.rds")
+```
+
+## metadata
+
+20181112: Also, just a reminder - both 0.5 and 0.75 mo timepoints are baseline.
+
+```{r}
+s <- read.table(file.path("sunbeam_output/mennella_metadata_20161206.txt"), sep="\t", header = TRUE) %>%
+  dplyr::select(CHOPSampleID, SubjectID, study_month, study_group, CHILD_GENDER, CHILD_RACE, CHILD_NORM.RAPID.GROWTH, TAS2r38) %>%
+  dplyr::rename(SampleID = CHOPSampleID) %>%
+  mutate(SampleID = sub("-","_", SampleID))
+
+read_counts <- read.table(file.path("sunbeam_output/preprocess_summary.tsv"), header = T) %>%
+  mutate(Samples = sub(".json", "", Samples, fixed = TRUE)) %>%
+  mutate(low_quality = (fwd_only + rev_only + dropped) / input) %>%
+  mutate(human = true / input) %>%
+  mutate(non_human = false / input) %>%
+  dplyr::rename(HostReads=true, NonHostReads=false, SampleID = Samples)
+
+s <- merge(s, read_counts, by="SampleID") %>%
+  mutate(SubjectID = as.factor(SubjectID)) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  mutate(study_group = as.factor(study_group)) %>%
+  mutate(study_month = as.factor(study_month)) #<- just for visualization
+
+s %<>% 
+  #filter(! study_month  %in% 0.5) %>%
+  mutate(study_group = fct_recode(study_group, "CMF"="A", "EHF"="B"))
+
+bsh.contig.blast %<>% filter(sample %in% s$SampleID)
+```
+
+# 20181210
+
+## bysample
+
+```{r fig.width=4.5, fig.height=3}
+bysample <- bsh.contig.blast %>%
+  group_by(sample) %>%
+  summarise(totalBSHReadCounts = sum(BSHReadCounts)) %>%
+  ungroup()
+
+bysample <- 
+  left_join(s, bysample, by=c("SampleID"= "sample")) %>%
+  mutate(totalBSHReadCounts = ifelse(is.na(totalBSHReadCounts), 0, as.numeric(totalBSHReadCounts))) %>%
+  mutate(BSHpresent = ifelse(totalBSHReadCounts > 0, TRUE, FALSE)) %>%
+  mutate(prop = totalBSHReadCounts/NonHostReads)
+
+bysample %>%
+  group_by(study_group, study_month) %>%
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n()) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=mean_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = mean_ab + se_ab, ymin = mean_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of bsh genes") +
+    ggtitle("Total BSH gene annotation") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+bysample %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_boxplot(coef=10000) +
+  geom_quasirandom() +
+  scale_y_continuous(labels=scales:::percent) +
+  scale_color_aaas() +
+  theme_bw() 
+  
+nah <- bysample %>%
+  ggplot(aes(x = study_month, y = prop, color = study_group, group=SubjectID)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(labels=scales:::percent) +
+  scale_color_aaas() +
+  theme_bw() +
+  facet_wrap(~study_group)
+```
+
+### all five time points linear mixed effects
+
+```{r}
+library(nlme)
+
+bysample %<>% mutate(LogProp = log10(prop + 1e-6))
+
+logit <- function (p) log(p / (1 - p))
+
+lme(LogProp ~ study_group * study_month, random=~1|SubjectID, data=bysample) %>% summary()
+```
+
+### formula effect at 4.5 month
+
+```{r}
+s_toTest <- bysample %>% filter(study_month %in% 4.5) %>% droplevels()
+
+lm(LogProp ~ study_group, data=s_toTest) %>% summary()
+
+```
+
+## byphylum
+
+```{r, fig.width=10, fig.height=5.5}
+byplylum <- bsh.contig.blast %>%
+  group_by(sample, phylum) %>%
+  summarise(totalBSHReadCounts = sum(BSHReadCounts)) %>%
+  ungroup() %>% 
+  mutate(phylum = ifelse(is.na(phylum), "Unassigned", as.character(phylum))) %>%
+  spread(phylum, totalBSHReadCounts, fill=0)
+
+byplylum <- left_join(s, byplylum, by=c("SampleID" = "sample")) %>%
+  gather(phylum, totalBSHReadCounts, p__Actinobacteria: p__Proteobacteria) %>%
+  mutate(totalBSHReadCounts =ifelse(is.na(totalBSHReadCounts), 0, as.numeric(totalBSHReadCounts))) %>%
+  mutate(prop = totalBSHReadCounts/NonHostReads)
+
+byplylum %>% 
+  ggplot(aes(x = study_month, y = prop, color = study_group)) +
+  geom_boxplot(coef = 100000) +
+  geom_quasirandom() +
+  theme_bw() +
+  scale_y_continuous(labels=scales:::percent) +
+  ggtitle("estimated BSH gene abundance from shotgun metagenomics data") +
+  scale_color_npg() +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  facet_wrap(~phylum, scale="free_y", ncol = 2)
+
+byplylum %>%
+  group_by(phylum, study_group, study_month) %>%
+  summarize(mean_ab = mean(prop), se_ab = sd(prop)/n()) %>%
+  ungroup() %>% 
+  ggplot(aes(x=study_month, y=mean_ab, color=study_group, fill=study_group, group=study_group)) +
+    geom_point() +
+    geom_line(color = "gray") +
+    theme_bw() +
+    geom_ribbon(aes(ymax = mean_ab + se_ab, ymin = mean_ab - se_ab), alpha=0.2) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    scale_y_continuous(labels=scales:::percent) +
+    labs(x="Study month",y="Relative abundance of BSH genes") +
+    ggtitle("Total BSH gene annotation") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~phylum, scale="free_y", ncol = 2)
+```
+
+```{r, fig.width=14, fig.height=12}
+s_toplot <- s %>% filter(study_month %in% c(0.5, 3.5)) %>% droplevels() 
+
+bsh.bygenus <- bsh.contig.blast %>%
+  mutate(common_taxa = as.character(common_taxa)) %>%
+  group_by(sample, common_taxa) %>%
+  summarise(totalBSHReadCounts = sum(BSHReadCounts)) %>%
+  ungroup()
+bai_species_cts <- bsh.bygenus %>% 
+  spread(sample, totalBSHReadCounts, fill=0)
+
+bsh.bygenus %>%
+  filter(sample %in% s_toplot$SampleID) %>%
+  left_join(s_toplot, by=c("sample" = "SampleID")) %>%
+  mutate(prop = totalBSHReadCounts / NonHostReads) %>%
+  ggplot(aes(SubjectID, common_taxa, fill=prop)) +
+  geom_tile(color="grey80", size=0.4) +
+  viridis::scale_fill_viridis(na.value="white", option = "A", direction = -1) +
+  theme_classic() +
+  theme(
+    axis.line = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y="genus",
+    fill="totalBSHReadCounts \nper sample per genus"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_grid(  ~ study_group + study_month, scale="free_x")
+```
+
+```{r presence absence, fig.width=10, eval=FALSE}
+df <- s %>%
+  left_join(bysample[,c("sample", "totalBSHReadCounts")], by=c("SampleID" = "sample")) %>% 
+  mutate(totalBSHReadCounts = ifelse(is.na(totalBSHReadCounts), 0, as.numeric(totalBSHReadCounts))) %>%
+  mutate(BSHpresent = ifelse(totalBSHReadCounts > 0, TRUE, FALSE))
+
+df %>%
+  group_by(study_group, study_month) %>%
+  summarise(present = sum(BSHpresent), absent = n()-sum(BSHpresent)) %>%
+  gather(Status, Count, present, absent) %>%
+  ggplot() +
+  geom_col(aes(x=study_month, y=Count, fill=Status)) +
+  scale_fill_npg() +
+  facet_grid(~ study_group)
+
+table(df$BSHpresent, df$study_group)
+fisher.test(table(df$BSHpresent, df$study_group))
+```
+
